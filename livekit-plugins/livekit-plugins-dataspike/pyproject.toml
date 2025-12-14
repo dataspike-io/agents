@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "livekit-plugins-dataspike"
+name = "dataspike-livekit-plugins"
 dynamic = ["version"]
 description = "Dataspike deepfake detection plugin for LiveKit Agents"
 readme = "README.md"
@@ -27,9 +27,9 @@ dependencies = [
 ]
 
 [project.urls]
-Documentation = "https://docs.livekit.io"
-Website = "https://livekit.io/"
-Source = "https://github.com/livekit/agents"
+Documentation = "https://docs.dataspike.io"
+Website = "https://dataspike.io/"
+Source = "https://github.com/dataspike-io/agents"
 
 [tool.hatch.version]
 path = "livekit/plugins/dataspike/version.py"

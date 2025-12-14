@@ -6,7 +6,7 @@ It enables detection of synthetic or manipulated media during live or recorded v
 ## Installation
 
 ```bash
-pip install livekit-plugins-dataspike
+pip install dataspike-livekit-plugins
 ```
 
 ## Prerequisites
