@@ -19,6 +19,7 @@ class DeepfakeStreamingSchemaResultEventType(betterproto.Enum):
 class DeepfakeStreamingSchemaFrameRequestFormat(betterproto.Enum):
     JPEG = 0
     WEBP = 1
+    PCM = 2
 
 
 @dataclass(eq=False, repr=False)

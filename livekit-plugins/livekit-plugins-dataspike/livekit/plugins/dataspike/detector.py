@@ -20,7 +20,7 @@ import os
 import random
 import time
 from collections.abc import Awaitable
-from typing import Callable
+from typing import Any, Callable
 
 import aiohttp
 
@@ -43,6 +43,59 @@ from livekit.plugins.dataspike.schema_pb2 import (
 from .log import logger
 
 
+class VideoParams:
+    """Configuration parameters for video frame processing.
+
+    Attributes
+    ----------
+    burst_fps:
+        Frame rate when SUSPICIOUS state is detected (higher rate for verification)
+    normal_fps:
+        Frame rate during CLEAR state (lower rate to conserve resources)
+    quality:
+        JPEG compression quality (0-100, where 100 is highest quality)
+    """
+
+    def __init__(
+        self,
+        burst_fps: float = 1,
+        normal_fps: float = 0.2,
+        quality: int = 75,
+    ):
+        self.burst_fps = burst_fps
+        self.normal_fps = normal_fps
+        self.quality = quality
+
+
+class AudioParams:
+    """Configuration parameters for audio processing.
+
+    Per Dataspike API requirements:
+    - Audio must be raw PCM format sampled at 16kHz
+    - Data sent in chunks of 48,000 samples (3 seconds of audio)
+    - Shorter final chunks should be zero-padded to required length
+
+    Attributes
+    ----------
+    sample_rate:
+        Required sampling rate in Hz (must be 16000)
+    sample_size:
+        Number of samples per chunk (48000 = 3 seconds at 16kHz)
+    interval:
+        Minimum seconds between audio samples
+    """
+
+    def __init__(
+        self,
+        sample_rate: int = 16000,
+        sample_size: int = 48000,  # 3 seconds * 16000 samples/sec
+        interval: int = 60,
+    ):
+        self.sample_rate = sample_rate
+        self.sample_size = sample_size
+        self.interval = interval
+
+
 class InputTrack:
     """Frame-sampling wrapper for a remote video track.
 
@@ -55,14 +108,10 @@ class InputTrack:
         The LiveKit `rtc.Track` to sample (must be a video track).
     participant_identity:
         Identity of the remote participant that owns `track`.
-    burst_fps:
-        Target FPS to use when the detection state is elevated (e.g., SUSPICIOUS).
-    normal_fps:
-        Baseline FPS to use during normal/clear operation.
+    video_params:
+        Video processing configuration (FPS, quality).
     state:
         Initial state for adaptive sampling; defaults to `EventType.CLEAR`.
-    quality:
-        JPEG quality (0-100) for encoded frames.
 
     Attributes
     ----------
@@ -77,16 +126,12 @@ class InputTrack:
         *,
         track: rtc.Track,
         participant_identity: str,
-        burst_fps: float = 1,
-        normal_fps: float = 0.2,
+        video_params: VideoParams,
         state: EventType = EventType.CLEAR,
-        quality: int = 75,
     ):
         self.track = track
         self.participant_identity = participant_identity
-        self.burst_fps = burst_fps
-        self.normal_fps = normal_fps
-        self.quality = quality
+        self.video_params = video_params
         self.last_sampled_time: float | None = None
         self.state = state
         self.running = False
@@ -94,7 +139,11 @@ class InputTrack:
     def _skip_frame(self, now: float) -> bool:
         """Return `True` if the current frame should be skipped given `now`."""
 
-        target_fps = self.burst_fps if self.state == EventType.SUSPICIOUS else self.normal_fps
+        target_fps = (
+            self.video_params.burst_fps
+            if self.state == EventType.SUSPICIOUS
+            else self.video_params.normal_fps
+        )
         if target_fps == 0:
             return True
 
@@ -142,7 +191,7 @@ class InputTrack:
                 frame,
                 EncodeOptions(
                     format="JPEG",
-                    quality=self.quality,
+                    quality=self.video_params.quality,
                 ),
             )
             event = DeepfakeStreamingSchemaFrameRequest(
@@ -168,6 +217,149 @@ class InputTrack:
         self.running = False
 
 
+class InputAudioTrack:
+    """Audio sampling wrapper for a remote audio track.
+
+    Accumulates audio frames into 3-second chunks (48,000 samples at 16kHz)
+    and enqueues them for transmission to Dataspike API. Audio is resampled
+    to the required 16kHz PCM format.
+
+    Parameters
+    ----------
+    track:
+        The LiveKit `rtc.Track` to sample (must be an audio track).
+    participant_identity:
+        Identity of the remote participant that owns `track`.
+    audio_params:
+        Audio processing configuration (sample rate, chunk size, interval).
+    user_speaking:
+        Whether the user is currently speaking (audio only processed during speech).
+
+    Attributes
+    ----------
+    last_sampled_time:
+        Timestamp of the last emitted audio chunk (seconds). `None` until the first sample.
+    audio_buffer:
+        Accumulated audio samples waiting to be sent.
+    running:
+        Whether the consumer loop should continue sampling.
+    """
+
+    def __init__(
+        self,
+        *,
+        track: rtc.Track,
+        participant_identity: str,
+        audio_params: AudioParams,
+    ):
+        self.track = track
+        self.participant_identity = participant_identity
+        self.audio_params = audio_params
+        self.last_sampled_time: float | None = None
+        self.audio_buffer: bytearray = bytearray()
+        self.running = False
+        self.user_speaking = False
+
+    async def consume(
+        self,
+        q: asyncio.Queue[DeepfakeStreamingSchemaFrameRequest],
+    ) -> None:
+        """Read audio frames from `track`, resample to 16kHz PCM, and accumulate into 3-second chunks.
+
+        The queue is bounded; if it is full or times out, chunks are dropped to keep
+        latency low.
+
+        Parameters
+        ----------
+        q:
+            The outbound queue to receive `DeepfakeStreamingSchemaFrameRequest` items.
+        """
+
+        self.running = True
+        stream = rtc.AudioStream(self.track)
+
+        # Create resampler if needed
+        resampler: rtc.AudioResampler | None = None
+
+        async for audio_event in stream:
+            now = time.time()
+            frame = audio_event.frame
+
+            if not self.running:
+                break
+
+            # Only process audio when user is actively speaking
+            if not self.user_speaking:
+                continue
+
+            # Enforce minimum interval between audio samples
+            if (
+                self.last_sampled_time is not None
+                and now - self.last_sampled_time < self.audio_params.interval
+            ):
+                continue
+
+            # Initialize resampler if needed (lazy initialization based on actual input rate)
+            if resampler is None and frame.sample_rate != self.audio_params.sample_rate:
+                resampler = rtc.AudioResampler(
+                    input_rate=frame.sample_rate,
+                    output_rate=self.audio_params.sample_rate,
+                    quality=rtc.AudioResamplerQuality.QUICK,
+                    num_channels=1,  # Dataspike expects mono audio
+                )
+
+            # Resample if necessary
+            if resampler is not None:
+                resampled_frames = resampler.push(frame)
+                for resampled_frame in resampled_frames:
+                    # Convert to bytes and accumulate
+                    self.audio_buffer.extend(resampled_frame.data)
+            else:
+                # No resampling needed
+                self.audio_buffer.extend(frame.data)
+
+            # Send when we have a complete 3-second chunk (sample_size * 2 bytes per sample for int16)
+            bytes_needed = self.audio_params.sample_size * 2  # int16 = 2 bytes per sample
+            if len(self.audio_buffer) >= bytes_needed:
+                chunk_data = bytes(self.audio_buffer[:bytes_needed])
+                self.audio_buffer = bytearray(self.audio_buffer[bytes_needed:])
+                self.last_sampled_time = now
+
+                # Create Dataspike API request
+                event = DeepfakeStreamingSchemaFrameRequest(
+                    participant_id=self.participant_identity,
+                    track_id=self.track.sid,
+                    timestamp_ms=int(now * 1000),
+                    format=DeepfakeStreamingSchemaFrameRequestFormat.PCM,
+                    data=chunk_data,
+                )
+
+                # Queue for sending (drop if queue is full to avoid blocking)
+                try:
+                    await asyncio.wait_for(q.put(event), timeout=0.05)
+                except asyncio.QueueFull:
+                    # Drop message silently
+                    pass
+                except asyncio.TimeoutError:
+                    pass
+
+        # Flush resampler if exists
+        if resampler is not None:
+            resampled_frames = resampler.flush()
+            for resampled_frame in resampled_frames:
+                self.audio_buffer.extend(resampled_frame.data)
+
+        await stream.aclose()
+
+    def stop(self) -> None:
+        """Signal the consumer loop to stop sampling."""
+        self.running = False
+
+    def set_speaking(self, speaking: bool) -> None:
+        """Update the speaking state to control audio processing."""
+        self.user_speaking = speaking
+
+
 class DataspikeDetector:
     """Real-time deepfake detector for LiveKit video rooms.
 
@@ -184,9 +376,8 @@ class DataspikeDetector:
         *,
         api_key: str | None = None,
         conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
-        burst_fps: float = 1,
-        normal_fps: float = 0.2,
-        quality: int = 75,
+        video_params: VideoParams | None = None,
+        audio_params: AudioParams | None = None,
         notification_cb: (
             Callable[[DeepfakeStreamingSchemaResultEvent], Awaitable[None]] | None
         ) = None,
@@ -194,8 +385,8 @@ class DataspikeDetector:
         """
         Initialize the Dataspike real-time deepfake detector.
 
-        The detector subscribes to remote participants' video tracks in a LiveKit room,
-        samples frames at an adaptive rate, and streams them to the Dataspike WebSocket
+        The detector subscribes to remote participants' video and audio tracks in a LiveKit room,
+        samples frames/audio at an adaptive rate, and streams them to the Dataspike WebSocket
         API for real-time analysis.
 
         Under the default configuration, the detector automatically **publishes analysis
@@ -216,16 +407,13 @@ class DataspikeDetector:
             conn_options:
                 Connection and retry settings for outbound API/WebSocket traffic.
                 Defaults to ``DEFAULT_API_CONNECT_OPTIONS`` from ``livekit.agents``.
-            burst_fps:
-                Maximum sampling rate (frames per second) applied when the current
-                state is elevated (e.g., ``SUSPICIOUS``). Use this to temporarily
-                increase scrutiny while limiting bandwidth. Default: ``1``.
-            normal_fps:
-                Baseline sampling rate (FPS) during normal operation (e.g., ``CLEAR``).
-                Default: ``0.2`` (one frame every five seconds).
-            quality:
-                JPEG quality (0–100) used when encoding frames before transmission.
-                Higher values increase fidelity and bandwidth. Default: ``75``.
+            video_params:
+                Optional video processing configuration. If not provided, uses default
+                VideoParams with burst_fps=1, normal_fps=0.2, quality=75.
+            audio_params:
+                Optional audio processing configuration. If provided, enables audio
+                deepfake detection alongside video. Audio is resampled to 16kHz PCM
+                and sent in 3-second chunks. If None, audio detection is disabled.
             notification_cb:
                 Optional async callback invoked when the detector receives a result
                 event from Dataspike. Signature:
@@ -304,9 +492,8 @@ class DataspikeDetector:
         if not self._api_key:
             raise ValueError("DATASPIKE_API_KEY must be set")
 
-        self._burst_fps = burst_fps
-        self._normal_fps = normal_fps
-        self._quality = quality
+        self._video_params = video_params if video_params is not None else VideoParams()
+        self._audio_params = audio_params if audio_params is not None else AudioParams()
 
         self._conn_options = conn_options
         self._session: aiohttp.ClientSession | None = None
@@ -321,30 +508,42 @@ class DataspikeDetector:
             maxsize=self.MAX_QUEUE_SIZE
         )
         self._input_tracks: list[InputTrack] = []
+        self._input_audio_tracks: list[InputAudioTrack] = []
 
         self._notification_cb = notification_cb or self._notify
 
-    async def start(self, agent_session: AgentSession, room: rtc.Room) -> None:
+    async def start(
+        self, agent_session: AgentSession, room: rtc.Room, vad_stream: Any = None
+    ) -> None:
         """Attach the detector to an agent session and a LiveKit room.
 
         This method:
         1) Caches `agent_session` and `room`.
         2) Starts the WebSocket sender/receiver tasks.
-        3) Scans existing remote participants for video tracks and begins sampling.
+        3) Scans existing remote participants for video and audio tracks and begins sampling.
         4) Subscribes to room events to track future subscribe/unsubscribe events.
+        5) Optionally integrates with a VAD stream for speech detection.
 
         Parameters
         ----------
         agent_session:
             The running `AgentSession` coordinating the LiveKit agent.
         room:
-            The connected `rtc.Room` whose remote video tracks will be monitored.
+            The connected `rtc.Room` whose remote video and audio tracks will be monitored.
+        vad_stream:
+            Optional VAD stream for detecting when users are speaking. If provided,
+            audio will only be processed during speech activity.
         """
 
         self._agent_session = agent_session
         self._room = room
 
         asyncio.create_task(self._run_ws_forever())
+
+        # If VAD stream is provided, start monitoring it for speech events
+        if vad_stream:
+            asyncio.create_task(self._monitor_vad(vad_stream))
+
         logger.info("Dataspike deepfake detector started")
 
         for participant in self._room.remote_participants.values():
@@ -352,6 +551,8 @@ class DataspikeDetector:
                 track = pub.track  # may be None until subscribed
                 if track and track.kind == rtc.TrackKind.KIND_VIDEO:
                     self._add_track(participant, track)
+                elif track and track.kind == rtc.TrackKind.KIND_AUDIO:
+                    self._add_audio_track(participant, track)
 
         @self._room.on("track_subscribed")
         def on_track_subscribed(
@@ -361,6 +562,8 @@ class DataspikeDetector:
         ) -> None:
             if track.kind == rtc.TrackKind.KIND_VIDEO:
                 self._add_track(participant, track)
+            elif track.kind == rtc.TrackKind.KIND_AUDIO:
+                self._add_audio_track(participant, track)
 
         @self._room.on("track_unsubscribed")
         def on_track_unsubscribed(
@@ -370,6 +573,8 @@ class DataspikeDetector:
         ) -> None:
             if track.kind == rtc.TrackKind.KIND_VIDEO:
                 self._remove_track(track)
+            elif track.kind == rtc.TrackKind.KIND_AUDIO:
+                self._remove_audio_track(track)
 
     def _add_track(self, participant: rtc.RemoteParticipant, track: rtc.Track) -> None:
         if track.kind != rtc.TrackKind.KIND_VIDEO:
@@ -378,9 +583,7 @@ class DataspikeDetector:
         input_track = InputTrack(
             track=track,
             participant_identity=participant.identity,
-            burst_fps=self._burst_fps,
-            normal_fps=self._normal_fps,
-            quality=self._quality,
+            video_params=self._video_params,
         )
         self._input_tracks.append(input_track)
 
@@ -398,6 +601,64 @@ class DataspikeDetector:
             )
             input_track.stop()
             self._input_tracks.remove(input_track)
+
+    def _add_audio_track(self, participant: rtc.RemoteParticipant, track: rtc.Track) -> None:
+        if track.kind != rtc.TrackKind.KIND_AUDIO:
+            return
+
+        input_audio_track = InputAudioTrack(
+            track=track,
+            participant_identity=participant.identity,
+            audio_params=self._audio_params,
+        )
+        self._input_audio_tracks.append(input_audio_track)
+
+        logger.debug(f"audio track subscribed: {track.sid} by {participant.identity}")
+        asyncio.create_task(input_audio_track.consume(self._send_queue))
+
+    def _remove_audio_track(self, track: rtc.Track) -> None:
+        if track.kind != rtc.TrackKind.KIND_AUDIO:
+            return
+
+        input_audio_track = next(
+            (t for t in self._input_audio_tracks if t.track.sid == track.sid), None
+        )
+        if input_audio_track:
+            logger.debug(
+                f"audio track unsubscribed: {track.sid} by {input_audio_track.participant_identity}"
+            )
+            input_audio_track.stop()
+            self._input_audio_tracks.remove(input_audio_track)
+
+    async def _monitor_vad(self, vad_stream: Any) -> None:
+        """Monitor VAD stream and update audio track speaking states.
+
+        This method listens for VAD events (START_OF_SPEECH, END_OF_SPEECH) and
+        updates all audio tracks to enable/disable audio processing based on
+        speech activity.
+
+        Parameters
+        ----------
+        vad_stream:
+            VAD stream that emits speech detection events.
+        """
+        try:
+            # Import VADEventType dynamically to avoid hard dependency
+            from livekit.agents import VADEventType
+
+            async for vad_event in vad_stream:
+                if vad_event.type == VADEventType.START_OF_SPEECH:
+                    logger.debug("User started speaking - enabling audio processing")
+                    for audio_track in self._input_audio_tracks:
+                        audio_track.set_speaking(True)
+                elif vad_event.type == VADEventType.END_OF_SPEECH:
+                    logger.debug("User stopped speaking - disabling audio processing")
+                    for audio_track in self._input_audio_tracks:
+                        audio_track.set_speaking(False)
+        except ImportError:
+            logger.warning("VAD support requires livekit.agents.VADEventType")
+        except Exception as e:
+            logger.error(f"Error monitoring VAD stream: {e}", exc_info=e)
 
     async def _notify(self, event: DeepfakeStreamingSchemaResultEvent) -> None:
         """Default notifier: publish a compact JSON alert into the room data channel."""

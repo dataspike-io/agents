@@ -23,16 +23,22 @@ Typical usage:
 
 Public API:
 - `InputTrack`: Internal helper representing a sampled video track.
+- `InputAudioTrack`: Internal helper representing a sampled audio track.
+- `VideoParams`: Configuration parameters for video processing.
+- `AudioParams`: Configuration parameters for audio processing.
 - `DataspikeDetector`: The main detector that manages sampling and the WS pipeline.
 """
 
-from .detector import DataspikeDetector
+from .detector import AudioParams, DataspikeDetector, VideoParams
 from .log import logger
 from .version import __version__
 
 __all__ = [
+    "AudioParams",
     "DataspikeDetector",
     "InputTrack",
+    "InputAudioTrack",
+    "VideoParams",
     "logger",
     "__version__",
 ]
